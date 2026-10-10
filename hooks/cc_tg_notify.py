@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -15,6 +16,7 @@ EVENTS = ("idle", "permission")
 PROMPT_LIMIT = 200
 REQUEST_TIMEOUT = 5
 GIT_TIMEOUT = 2
+TASK_ID_PATTERN = re.compile(r"<task-id>([^<]+)</task-id>")
 
 
 def load_config(path):
@@ -53,6 +55,53 @@ def last_prompt(transcript_path):
     if not prompt.strip():
         return None
     return truncate(" ".join(prompt.split()), PROMPT_LIMIT)
+
+
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def launched_agent(record):
+    result = as_dict(record.get("toolUseResult"))
+    if result.get("status") == "async_launched":
+        return result.get("agentId")
+    return None
+
+
+def finished_agents(record):
+    attachment = as_dict(record.get("attachment"))
+    message = as_dict(record.get("message"))
+    for body in (record.get("content"), attachment.get("prompt"), message.get("content")):
+        if isinstance(body, str) and "<status>" in body:
+            return TASK_ID_PATTERN.findall(body)
+    return []
+
+
+def running_agents(transcript_path):
+    if not transcript_path:
+        return set()
+
+    launched = set()
+    finished = set()
+    try:
+        with open(transcript_path, encoding="utf-8") as transcript:
+            for line in transcript:
+                if "async_launched" not in line and "<task-id>" not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                agent = launched_agent(record)
+                if agent:
+                    launched.add(agent)
+                finished.update(finished_agents(record))
+    except (OSError, UnicodeDecodeError):
+        return set()
+
+    return launched - finished
 
 
 def git_branch(cwd):
@@ -113,7 +162,13 @@ def main():
         return 0
 
     try:
-        send(load_config(CONFIG_PATH), build_payload(event, json.load(sys.stdin)))
+        hook_input = json.load(sys.stdin)
+        if event == "idle":
+            agents = running_agents(hook_input.get("transcript_path"))
+            if agents:
+                log(f"idle: suppressed, background agents running: {', '.join(sorted(agents))}")
+                return 0
+        send(load_config(CONFIG_PATH), build_payload(event, hook_input))
     except Exception as error:
         log(f"{event}: {type(error).__name__}: {error}")
     return 0

@@ -21,6 +21,26 @@ def transcript(tmp_path, records):
     return str(path)
 
 
+def launch_record(agent_id):
+    return {
+        "type": "user",
+        "toolUseResult": {"isAsync": True, "status": "async_launched", "agentId": agent_id},
+    }
+
+
+def task_notification(agent_ids, status="completed"):
+    tags = "".join(f"<task-id>{agent_id}</task-id>" for agent_id in agent_ids)
+    return f"<task-notification>{tags}<status>{status}</status></task-notification>"
+
+
+def notification_record(body, record_type="user"):
+    if record_type == "queue-operation":
+        return {"type": "queue-operation", "operation": "remove", "content": body}
+    if record_type == "attachment":
+        return {"type": "attachment", "attachment": {"prompt": body}}
+    return {"type": "user", "message": {"content": body}}
+
+
 class LastPromptTest(unittest.TestCase):
     def setUp(self):
         self.tmp_path = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -78,6 +98,94 @@ class LastPromptTest(unittest.TestCase):
         self.assertIsNone(hook.last_prompt(path))
 
 
+class RunningAgentsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp_path = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def running(self, records):
+        return hook.running_agents(transcript(self.tmp_path, records))
+
+    def test_reports_agent_that_has_not_finished(self):
+        self.assertEqual(self.running([launch_record("a1")]), {"a1"})
+
+    def test_clears_agent_after_each_notification_shape(self):
+        for record_type in ("user", "queue-operation", "attachment"):
+            with self.subTest(record_type=record_type):
+                records = [
+                    launch_record("a1"),
+                    notification_record(task_notification(["a1"]), record_type),
+                ]
+                self.assertEqual(self.running(records), set())
+
+    def test_clears_agent_on_every_terminal_status(self):
+        for status in ("completed", "failed", "killed", "stopped"):
+            with self.subTest(status=status):
+                records = [
+                    launch_record("a1"),
+                    notification_record(task_notification(["a1"], status)),
+                ]
+                self.assertEqual(self.running(records), set())
+
+    def test_clears_every_agent_of_a_recovery_notification(self):
+        records = [
+            launch_record("a1"),
+            launch_record("a2"),
+            notification_record(task_notification(["a1", "a2"], "stopped")),
+        ]
+        self.assertEqual(self.running(records), set())
+
+    def test_keeps_agent_when_notification_carries_no_task_id(self):
+        body = "<task-notification>Goal check-in: background work still running</task-notification>"
+        records = [launch_record("a1"), notification_record(body)]
+        self.assertEqual(self.running(records), {"a1"})
+
+    def test_keeps_agent_when_notification_carries_no_status(self):
+        body = "<task-notification><task-id>a1</task-id><event>done</event></task-notification>"
+        records = [launch_record("a1"), notification_record(body)]
+        self.assertEqual(self.running(records), {"a1"})
+
+    def test_skips_records_that_are_not_objects(self):
+        path = self.tmp_path / "shapes.jsonl"
+        path.write_text(
+            '["async_launched"]\n"async_launched"\n' + json.dumps(launch_record("a1")) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(hook.running_agents(str(path)), {"a1"})
+
+    def test_skips_notification_section_that_is_not_an_object(self):
+        records = [launch_record("a1"), {"type": "user", "message": "not an object"}]
+        self.assertEqual(self.running(records), {"a1"})
+
+    def test_ignores_launch_without_agent_id(self):
+        records = [{"type": "user", "toolUseResult": {"status": "async_launched"}}]
+        self.assertEqual(self.running(records), set())
+
+    def test_ignores_synchronous_agent_result(self):
+        records = [{"type": "user", "toolUseResult": {"status": "completed", "agentId": "a1"}}]
+        self.assertEqual(self.running(records), set())
+
+    def test_skips_malformed_lines(self):
+        path = self.tmp_path / "broken.jsonl"
+        path.write_text(
+            '{"type":"user","toolUseResult":{"status":"async_launched","agentId":"a1"}\n'
+            + json.dumps(launch_record("a2"))
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(hook.running_agents(str(path)), {"a2"})
+
+    def test_returns_empty_without_transcript_path(self):
+        self.assertEqual(hook.running_agents(None), set())
+
+    def test_returns_empty_when_transcript_is_missing(self):
+        self.assertEqual(hook.running_agents(str(self.tmp_path / "absent.jsonl")), set())
+
+    def test_returns_empty_when_transcript_is_not_utf8(self):
+        path = self.tmp_path / "binary.jsonl"
+        path.write_bytes(b'{"toolUseResult":{"status":"async_launched"}}\xff\xfe\n')
+        self.assertEqual(hook.running_agents(str(path)), set())
+
+
 class GitBranchTest(unittest.TestCase):
     def setUp(self):
         self.tmp_path = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -132,6 +240,17 @@ class MainTest(unittest.TestCase):
         self.enterContext(mock.patch.object(hook, "LOG_PATH", self.log))
         self.enterContext(mock.patch.object(sys, "stdin", io.StringIO('{"cwd": "/tmp"}')))
 
+    def config_file(self):
+        config = self.tmp_path / "config.json"
+        config.write_text(
+            json.dumps({"url": "https://example.com", "secret": "s"}), encoding="utf-8"
+        )
+        return config
+
+    def hook_input(self, records):
+        payload = {"cwd": "/tmp", "transcript_path": transcript(self.tmp_path, records)}
+        return io.StringIO(json.dumps(payload))
+
     def test_reports_unknown_event_without_reading_stdin(self):
         with mock.patch.object(sys, "argv", ["cc_tg_notify.py"]):
             self.assertEqual(hook.main(), 0)
@@ -161,6 +280,41 @@ class MainTest(unittest.TestCase):
             {"url": "https://example.com", "secret": "s"},
             {"event": "permission", "project": "tmp", "branch": "main", "prompt": None},
         )
+        self.assertFalse(self.log.exists())
+
+    def test_suppresses_idle_while_a_background_agent_runs(self):
+        with mock.patch.object(hook, "CONFIG_PATH", self.config_file()), mock.patch.object(
+            sys, "argv", ["cc_tg_notify.py", "idle"]
+        ), mock.patch.object(sys, "stdin", self.hook_input([launch_record("a1")])), mock.patch.object(
+            hook, "send"
+        ) as send:
+            self.assertEqual(hook.main(), 0)
+
+        send.assert_not_called()
+        self.assertIn("suppressed", self.log.read_text(encoding="utf-8"))
+        self.assertIn("a1", self.log.read_text(encoding="utf-8"))
+
+    def test_sends_idle_after_a_background_agent_finished(self):
+        records = [launch_record("a1"), notification_record(task_notification(["a1"]))]
+        with mock.patch.object(hook, "CONFIG_PATH", self.config_file()), mock.patch.object(
+            sys, "argv", ["cc_tg_notify.py", "idle"]
+        ), mock.patch.object(sys, "stdin", self.hook_input(records)), mock.patch.object(
+            hook, "git_branch", return_value=None
+        ), mock.patch.object(hook, "send") as send:
+            self.assertEqual(hook.main(), 0)
+
+        send.assert_called_once()
+        self.assertFalse(self.log.exists())
+
+    def test_does_not_suppress_permission_prompt(self):
+        with mock.patch.object(hook, "CONFIG_PATH", self.config_file()), mock.patch.object(
+            sys, "argv", ["cc_tg_notify.py", "permission"]
+        ), mock.patch.object(sys, "stdin", self.hook_input([launch_record("a1")])), mock.patch.object(
+            hook, "git_branch", return_value=None
+        ), mock.patch.object(hook, "send") as send:
+            self.assertEqual(hook.main(), 0)
+
+        send.assert_called_once()
         self.assertFalse(self.log.exists())
 
     def test_survives_unreachable_function(self):
