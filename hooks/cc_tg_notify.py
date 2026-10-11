@@ -111,6 +111,7 @@ def git_branch(cwd):
         result = subprocess.run(
             ["git", "-C", cwd, "branch", "--show-current"],
             capture_output=True,
+            check=False,
             text=True,
             timeout=GIT_TIMEOUT,
         )
@@ -150,7 +151,7 @@ def send(config, payload):
 def log(message):
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as logfile:
-            logfile.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
+            logfile.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")  # noqa: DTZ005 - local log timestamp
     except OSError:
         pass
 
@@ -169,7 +170,7 @@ def main():
                 log(f"idle: suppressed, background agents running: {', '.join(sorted(agents))}")
                 return 0
         send(load_config(CONFIG_PATH), build_payload(event, hook_input))
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - a hook must never break the session
         log(f"{event}: {type(error).__name__}: {error}")
     return 0
 
