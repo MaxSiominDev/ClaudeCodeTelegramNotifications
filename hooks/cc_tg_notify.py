@@ -17,6 +17,7 @@ PROMPT_LIMIT = 200
 REQUEST_TIMEOUT = 5
 GIT_TIMEOUT = 2
 TASK_ID_PATTERN = re.compile(r"<task-id>([^<]+)</task-id>")
+QUESTION_TOOL = "AskUserQuestion"
 
 
 def load_config(path):
@@ -104,6 +105,39 @@ def running_agents(transcript_path):
     return launched - finished
 
 
+def pending_question(transcript_path):
+    if not transcript_path:
+        return False
+
+    unanswered = set()
+    try:
+        with open(transcript_path, encoding="utf-8") as transcript:
+            for line in transcript:
+                if '"tool_use"' not in line and '"tool_result"' not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                content = as_dict(record.get("message")).get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use":
+                        if block.get("name") == QUESTION_TOOL:
+                            unanswered.add(block.get("id"))
+                    elif block.get("type") == "tool_result":
+                        unanswered.discard(block.get("tool_use_id"))
+    except (OSError, UnicodeDecodeError):
+        return False
+
+    return bool(unanswered)
+
+
 def git_branch(cwd):
     if not cwd:
         return None
@@ -164,6 +198,8 @@ def main():
 
     try:
         hook_input = json.load(sys.stdin)
+        if event == "permission" and pending_question(hook_input.get("transcript_path")):
+            event = "question"
         if event == "idle":
             agents = running_agents(hook_input.get("transcript_path"))
             if agents:

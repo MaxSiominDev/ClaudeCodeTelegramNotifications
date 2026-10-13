@@ -52,6 +52,12 @@ class BuildMessageTest(unittest.TestCase):
             message, "Claude Code · notifier\nWaiting for permission to use a tool"
         )
 
+    def test_labels_a_question_event_as_needing_an_answer(self):
+        message = index.build_message(
+            {"event": "question", "project": "notifier", "branch": None, "prompt": None}
+        )
+        self.assertEqual(message, "Claude Code · notifier\nNeeds your answer")
+
     def test_truncates_to_telegram_limit(self):
         message = index.build_message(
             {"event": "idle", "project": "p", "branch": None, "prompt": "x" * 5000}
@@ -120,6 +126,12 @@ class HandlerTest(unittest.TestCase):
 
         self.assertEqual(result["statusCode"], 400)
         self.telegram.assert_not_called()
+
+    def test_accepts_a_question_event(self):
+        result = index.handler(request(self.payload(event="question")), None)
+
+        self.assertEqual(result["statusCode"], 200)
+        self.assertIn("Needs your answer", self.telegram.call_args.args[1])
 
     def test_rejects_empty_project(self):
         result = index.handler(request(self.payload(project="")), None)
