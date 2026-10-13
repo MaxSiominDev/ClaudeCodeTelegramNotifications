@@ -16,6 +16,7 @@ API_TOKEN_HEADER = "X-Api-Token"
 EVENT_LINES = {
     "idle": "Finished responding, waiting for you",
     "permission": "Waiting for permission to use a tool",
+    "question": "Needs your answer",
 }
 
 

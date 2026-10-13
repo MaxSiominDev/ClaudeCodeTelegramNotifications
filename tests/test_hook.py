@@ -186,6 +186,85 @@ class RunningAgentsTest(unittest.TestCase):
         self.assertEqual(hook.running_agents(str(path)), set())
 
 
+def tool_use(name, tool_id):
+    return {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tool_id, "name": name}]}}
+
+
+def tool_result(tool_id):
+    return {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tool_id}]}}
+
+
+class PendingQuestionTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp_path = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def pending(self, records):
+        return hook.pending_question(transcript(self.tmp_path, records))
+
+    def test_true_while_the_question_has_no_answer(self):
+        records = [
+            tool_use("Bash", "t1"),
+            tool_result("t1"),
+            tool_use(hook.QUESTION_TOOL, "t2"),
+        ]
+        self.assertTrue(self.pending(records))
+
+    def test_false_once_the_answer_arrived(self):
+        records = [tool_use(hook.QUESTION_TOOL, "t1"), tool_result("t1")]
+        self.assertFalse(self.pending(records))
+
+    def test_false_when_the_pending_tool_is_not_a_question(self):
+        records = [tool_use("Bash", "t1")]
+        self.assertFalse(self.pending(records))
+
+    def test_true_with_a_question_pending_between_answered_ones(self):
+        records = [
+            tool_use(hook.QUESTION_TOOL, "t1"),
+            tool_result("t1"),
+            tool_use("Bash", "t2"),
+            tool_result("t2"),
+            tool_use(hook.QUESTION_TOOL, "t3"),
+        ]
+        self.assertTrue(self.pending(records))
+
+    def test_skips_records_that_are_not_objects(self):
+        path = self.tmp_path / "shapes.jsonl"
+        path.write_text(
+            '["tool_use"]\n"tool_use"\n' + json.dumps(tool_use(hook.QUESTION_TOOL, "t1")) + "\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(hook.pending_question(str(path)))
+
+    def test_ignores_blocks_that_are_not_objects(self):
+        records = [{"type": "assistant", "message": {"content": ["tool_use", 7]}}]
+        self.assertFalse(self.pending(records))
+
+    def test_ignores_content_that_is_not_a_list(self):
+        records = [{"type": "assistant", "message": {"content": "tool_use"}}]
+        self.assertFalse(self.pending(records))
+
+    def test_skips_malformed_lines(self):
+        path = self.tmp_path / "broken.jsonl"
+        path.write_text(
+            '{"type":"assistant","message":{"content":[{"type":"tool_use" broken\n'
+            + json.dumps(tool_use(hook.QUESTION_TOOL, "t1"))
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(hook.pending_question(str(path)))
+
+    def test_returns_false_without_transcript_path(self):
+        self.assertFalse(hook.pending_question(None))
+
+    def test_returns_false_when_transcript_is_missing(self):
+        self.assertFalse(hook.pending_question(str(self.tmp_path / "absent.jsonl")))
+
+    def test_returns_false_when_transcript_is_not_utf8(self):
+        path = self.tmp_path / "binary.jsonl"
+        path.write_bytes(b'{"tool_use":"\xff\xfe"}\n')
+        self.assertFalse(hook.pending_question(str(path)))
+
+
 class GitBranchTest(unittest.TestCase):
     def setUp(self):
         self.tmp_path = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -316,6 +395,32 @@ class MainTest(unittest.TestCase):
 
         send.assert_called_once()
         self.assertFalse(self.log.exists())
+
+    def test_sends_question_when_an_answer_is_pending(self):
+        records = [tool_use(hook.QUESTION_TOOL, "t1")]
+        with mock.patch.object(hook, "CONFIG_PATH", self.config_file()), mock.patch.object(
+            sys, "argv", ["cc_tg_notify.py", "permission"]
+        ), mock.patch.object(sys, "stdin", self.hook_input(records)), mock.patch.object(
+            hook, "git_branch", return_value=None
+        ), mock.patch.object(hook, "send") as send:
+            self.assertEqual(hook.main(), 0)
+
+        send.assert_called_once()
+        payload = send.call_args.args[1]
+        self.assertEqual(payload["event"], "question")
+
+    def test_keeps_permission_when_the_pending_tool_is_not_a_question(self):
+        records = [tool_use("Bash", "t1")]
+        with mock.patch.object(hook, "CONFIG_PATH", self.config_file()), mock.patch.object(
+            sys, "argv", ["cc_tg_notify.py", "permission"]
+        ), mock.patch.object(sys, "stdin", self.hook_input(records)), mock.patch.object(
+            hook, "git_branch", return_value=None
+        ), mock.patch.object(hook, "send") as send:
+            self.assertEqual(hook.main(), 0)
+
+        send.assert_called_once()
+        payload = send.call_args.args[1]
+        self.assertEqual(payload["event"], "permission")
 
     def test_survives_unreachable_function(self):
         config = self.tmp_path / "config.json"

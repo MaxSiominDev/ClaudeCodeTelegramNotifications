@@ -4,9 +4,9 @@ Claude Code can finish a turn while you are looking somewhere else. This project
 
 Claude Code already exposes the events we need through its `Notification` hook.
 
-`idle_prompt` fires about a minute after a turn finishes if you have not typed anything since. `permission_prompt` fires when a tool is waiting for approval.
+`idle_prompt` fires about a minute after a turn finishes if you have not typed anything since. `permission_prompt` fires when a tool is waiting for approval, and also when Claude Code shows the dialog asking you to choose between answer options. The payload is the same in both cases, so the hook looks into the session transcript: if the pending tool call is `AskUserQuestion`, the event is forwarded as `question` instead of `permission`.
 
-This project forwards both events to Telegram through a Yandex Cloud Function.
+This project forwards these events to Telegram through a Yandex Cloud Function.
 
 ```text
 Claude Code -> hooks/cc_tg_notify.py -> Cloud Function -> Telegram
